@@ -1,0 +1,4 @@
+# Arquivo de Zona DNS Local
+# Formato: DOMINIO IP
+
+meuservidor.ufpi.br 10.0.0.3

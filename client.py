@@ -1,112 +1,108 @@
-import argparse
-import socket
-import time
-import os
-import csv
+import socket, time, csv, argparse, os
 from utils import *
 
-def registrar_metricas(protocolo_nome, transfer_time, throughput_mbps, total_bytes_enviados):
-    """Função de métricas para imprimir no terminal e gerar o CSV."""
-    print("\n" + "="*40)
-    print(f"MÉTRICAS DA APLICAÇÃO (CLIENTE {protocolo_nome})")
-    print("="*40)
-    print(f"Arquivo enviado   : {ARQUIVO_PARA_ENVIAR}")
-    print(f"Volume de dados   : {total_bytes_enviados} bytes")
-    print(f"Tempo de envio    : {transfer_time:.4f} segundos")
-    print(f"Throughput        : {throughput_mbps:.4f} Mbps")
-    print("="*40)
+def resolve(dom):
+    start = time.time()
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.settimeout(TIMEOUT_DNS)
+        req = f"ID:1001;NAME:{dom}".encode()
+        for _ in range(3):
+            try:
+                s.sendto(req, (DNS_IP, DNS_PORT))
+                d, _ = s.recvfrom(BUF)
+                parts = dict(p.split(':') for p in d.decode().split(';') if ':' in p)
+                if parts.get('IP') != "NOT_FOUND": return parts.get('IP'), time.time() - start
+            except: continue
+    return None, time.time() - start
 
-    arquivo_existe = os.path.isfile(DADOS_CONSOLIDADOS)
+def save_metrics(proto, arq, t_trans, t_dns, b_env, b_rec, size):
+    vol = b_env + b_rec
+    mbps = ((vol * 8) / t_trans / 1e6) if t_trans > 0 else 0
+    overhead = vol - size
     
-    with open(DADOS_CONSOLIDADOS, mode='a', newline='') as file:
-        writer = csv.writer(file)
-        if not arquivo_existe:
-            writer.writerow(["Protocolo", "Tempo_Segundos", "Throughput_Mbps", "Volume_Bytes"])
-        writer.writerow([protocolo_nome, transfer_time, throughput_mbps, total_bytes_enviados])
+    file_path = "results/dados_consolidados.csv"
+    file_exists = os.path.exists(file_path) and os.path.getsize(file_path) > 0
+    
+    with open(file_path, 'a', newline='') as f:
+        writer = csv.writer(f)
+        # Escreve o cabeçalho apenas se o arquivo não existir ou estiver vazio
+        if not file_exists:
+            writer.writerow([
+                "Protocolo", "Arquivo_Solicitado", "Tamanho_Arquivo", 
+                "Tempo_DNS", "Tempo_Transferencia", "Bytes_Enviados", 
+                "Bytes_Recebidos", "Overhead", "Throughput"
+            ])
+        writer.writerow([proto, arq, size, t_dns, t_trans, b_env, b_rec, overhead, mbps])
 
-def start_client(protocol):
-    is_tcp = (protocol == 'tcp') # O código assume que se não é TCP é R-UDP
-    sock_type = socket.SOCK_STREAM if is_tcp else socket.SOCK_DGRAM
-    port = PORT_TCP if is_tcp else PORT_UDP
-    protocolo_nome = "TCP" if is_tcp else "R-UDP"
-    chunk_size = BUFFER_SIZE if is_tcp else PAYLOAD_SIZE
-
-    if not os.path.exists(ARQUIVO_PARA_ENVIAR):
-        print(f"[!] Erro: O arquivo '{ARQUIVO_PARA_ENVIAR}' não foi encontrado.")
-        return
-
-    auth_hash = gerar_hash_autenticacao(MATRICULA_ALUNO, NOME_ALUNO)
-    total_bytes_enviados = 0
-    seq = 0
-
-    print(f"[*] Iniciando transferência {protocolo_nome} para {CLIENT_HOST}:{port}...")
-
-    with socket.socket(socket.AF_INET, sock_type) as client_socket:
+def run(proto, arq):
+    resultado_dns = resolve("meuservidor.ufpi.br")
+    if not resultado_dns[0]: return
+    ip, t_dns = resultado_dns
+    
+    dest = "temp_files/recebido.dat"
+    t0 = time.time()
+    
+    is_tcp = (proto == 'TCP')
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM if is_tcp else socket.SOCK_DGRAM)
+    bytes_env, bytes_rec, file_size = 0, 0, 0
+    
+    if is_tcp:
+        sock.connect((ip, TCP_PORT))
+        req = f"GET {arq} HTTP/1.1\r\nHost: meuservidor.ufpi.br\r\n\r\n".encode()
+        sock.sendall(req); bytes_env += len(req)
+        with open(dest, "wb") as f:
+            header_ok = False
+            while d := sock.recv(BUF):
+                bytes_rec += len(d)
+                if not header_ok and b'\r\n\r\n' in d:
+                    _, body = d.split(b'\r\n\r\n', 1)
+                    f.write(body); file_size += len(body); header_ok = True
+                elif header_ok:
+                    f.write(d); file_size += len(d)
+    else:
+        # Lógica de recebimento RUDP com tratamento de confirmação
+        sock.settimeout(TIMEOUT_RUDP * 10)
+        req = f"GET {arq} HTTP/1.1\r\nHost: meuservidor.ufpi.br\r\n\r\n".encode()
+        pacote_get = make_pkt(get_auth(MATRICULA, NOME), 0, req)
         
-        if is_tcp:
-            client_socket.connect((CLIENT_HOST, port))
-            print("[+] Ligação estabelecida com sucesso!")
-            header = f"X-Custom-Auth: {auth_hash}"
-            header_bytes = header.encode('utf-8') + DELIMITER
-            client_socket.sendall(header_bytes)
-            print(f"[*] Cabeçalho de autenticação enviado: {header}")
-        else:
-            client_socket.settimeout(TIMEOUT)
-
-        start_time = time.time()
-
-        with open(ARQUIVO_PARA_ENVIAR, "rb") as file:
-            while True:
-                chunk = file.read(chunk_size)
-                if not chunk:
-                    break
-                
-                if is_tcp:
-                    client_socket.sendall(chunk)
-                    total_bytes_enviados += len(chunk)
-                
-                else:
-                    pacote = criar_pacote(auth_hash, seq, chunk)
-                    ack_recebido = False
-
-                    while not ack_recebido:
-                        client_socket.sendto(pacote, (CLIENT_HOST, port))
-                        try:
-                            ack_data, _ = client_socket.recvfrom(1024)
-                            if ack_data.decode('utf-8') == f"ACK:{seq}":
-                                ack_recebido = True
-                                total_bytes_enviados += len(chunk)
-                                seq = 1 - seq # Alterna sequência
-                        except socket.timeout:
-                            pass
-
-        # Envio do pacote EOF do protocolo R-UDP
-        if not is_tcp:
-            eof_pacote = criar_pacote(auth_hash, seq, b'', is_eof=True)
-            ack_eof_recebido = False
-            while not ack_eof_recebido:
-                client_socket.sendto(eof_pacote, (CLIENT_HOST, port))
-                try:
-                    ack_data, _ = client_socket.recvfrom(1024)
-                    if ack_data.decode('utf-8') == f"ACK:{seq}":
-                        ack_eof_recebido = True
-                except socket.timeout:
-                    pass 
-
-        end_time = time.time()
-
-    transfer_time = end_time - start_time
-    throughput_bps = (total_bytes_enviados * 8) / transfer_time if transfer_time > 0 else 0
-    registrar_metricas(protocolo_nome, transfer_time, throughput_bps / 1_000_000, total_bytes_enviados)
+        done = False
+        while not done:
+            sock.sendto(pacote_get, (ip, UDP_PORT))
+            bytes_env += len(pacote_get)
+            
+            seq_esperado, header_ok = 1, False
+            file_size = 0
+            with open(dest, "wb") as f:
+                while True:
+                    try:
+                        pkt, addr = sock.recvfrom(BUF)
+                        bytes_rec += len(pkt)
+                        if SEP in pkt:
+                            head_b, load = pkt.split(SEP, 1)
+                            head_d = dict(p.split(':', 1) for p in head_b.decode().split(';') if ':' in p)
+                            seq = int(head_d.get('Seq', -1))
+                            eof = head_d.get('EOF') == 'True'
+                            
+                            if get_checksum(load) == head_d.get('Checksum'):
+                                sock.sendto(f"ACK:{seq}".encode(), addr) # ACK para o servidor
+                                bytes_env += len(f"ACK:{seq}".encode())
+                                if seq == seq_esperado:
+                                    if not header_ok and b'\r\n\r\n' in load:
+                                        _, body = load.split(b'\r\n\r\n', 1)
+                                        f.write(body); file_size += len(body); header_ok = True
+                                    elif header_ok:
+                                        f.write(load); file_size += len(load)
+                                    seq_esperado = 1 - seq_esperado
+                                if eof: 
+                                    done = True
+                                    break
+                    except socket.timeout: break
+        
+    save_metrics(proto, arq.split('/')[-1], time.time() - t0, t_dns, bytes_env, bytes_rec, file_size)
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Cliente de Transferência de Arquivos")
-    parser.add_argument('--protocol', choices=['tcp', 'rudp'], required=True, help="Protocolo: tcp ou rudp")
-    args = parser.parse_args()
-
-    if not os.path.exists(ARQUIVO_PARA_ENVIAR):
-        print(f"[*] Criando arquivo de teste '{ARQUIVO_PARA_ENVIAR}' (1MB)...")
-        with open(ARQUIVO_PARA_ENVIAR, "wb") as f:
-            f.write(os.urandom(1024 * 1024))
-
-    start_client(args.protocol)
+    p = argparse.ArgumentParser()
+    p.add_argument('--protocol', choices=['TCP', 'RUDP'], required=True)
+    p.add_argument('--file', default='index.html')
+    args = p.parse_args()
+    run(args.protocol, args.file)

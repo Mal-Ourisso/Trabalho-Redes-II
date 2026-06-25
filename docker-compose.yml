@@ -1,0 +1,41 @@
+version: "3.8"
+
+services:
+  servidor-dns:
+    build: .
+    container_name: meu-servidor-dns
+    command: tail -f /dev/null
+    volumes:
+      - .:/app
+    networks:
+      rede_trabalho:
+        ipv4_address: 10.0.0.2
+
+  servidor-web:
+    build: .
+    container_name: meu-servidor-web
+    command: tail -f /dev/null
+    volumes:
+      - .:/app
+    networks:
+      rede_trabalho:
+        ipv4_address: 10.0.0.3
+
+  cliente:
+    build: .
+    container_name: meu-cliente
+    command: tail -f /dev/null
+    cap_add:
+      - NET_ADMIN # Necessário para o comando 'tc'
+    volumes:
+      - .:/app
+    networks:
+      rede_trabalho:
+        ipv4_address: 10.0.0.4
+
+networks:
+  rede_trabalho:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.0.0.0/24
